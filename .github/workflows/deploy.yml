@@ -15,6 +15,7 @@ concurrency:
 jobs:
   validate-build-deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -30,20 +31,24 @@ jobs:
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
         run: |
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
+          set -euo pipefail
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$EC2_SSH_KEY" > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
 
       - name: Transfer image to EC2
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
         run: |
+          set -euo pipefail
           docker save "yinka-portfolio:${GITHUB_SHA}" | gzip | \
-            ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes \
-              -o StrictHostKeyChecking=yes "$EC2_USER@$EC2_HOST" \
+            ssh -i "$HOME/.ssh/deploy_key" \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              "$EC2_USER@$EC2_HOST" \
               'gunzip | docker load'
 
       - name: Deploy exact commit with rollback protection
@@ -52,39 +57,60 @@ jobs:
           EC2_USER: ${{ secrets.EC2_USER }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes "$EC2_USER@$EC2_HOST" \
+          ssh -i "$HOME/.ssh/deploy_key" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
             "IMAGE_TAG='$IMAGE_TAG' bash -s" <<'REMOTE'
+
           set -eu
+
           NEW_IMAGE="yinka-portfolio:${IMAGE_TAG}"
           OLD_IMAGE=""
+
           if docker inspect portfolio >/dev/null 2>&1; then
             OLD_IMAGE="$(docker inspect --format='{{.Config.Image}}' portfolio)"
           fi
 
           docker rm -f portfolio >/dev/null 2>&1 || true
-          docker run -d --name portfolio --restart unless-stopped -p 80:80 "$NEW_IMAGE"
+
+          docker run -d \
+            --name portfolio \
+            --restart unless-stopped \
+            -p 80:80 \
+            "$NEW_IMAGE"
 
           healthy=0
+
           for attempt in $(seq 1 20); do
-            if curl --fail --silent http://127.0.0.1/ >/dev/null; then
+            STATUS="$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' portfolio 2>/dev/null || true)"
+
+            if [ "$STATUS" = "healthy" ]; then
               healthy=1
               break
             fi
+
             sleep 3
           done
 
           if [ "$healthy" -ne 1 ]; then
             docker logs portfolio || true
             docker rm -f portfolio >/dev/null 2>&1 || true
+
             if [ -n "$OLD_IMAGE" ]; then
-              docker run -d --name portfolio --restart unless-stopped -p 80:80 "$OLD_IMAGE"
+              docker run -d \
+                --name portfolio \
+                --restart unless-stopped \
+                -p 80:80 \
+                "$OLD_IMAGE"
             fi
-            echo "Deployment health check failed; previous image restored when available."
+
+            echo "Deployment failed. Previous image restored when available."
             exit 1
           fi
 
           echo "Deployed ${NEW_IMAGE}"
+
           REMOTE
 
       - name: Verify public website
@@ -96,7 +122,9 @@ jobs:
               echo "Public website responds successfully."
               exit 0
             fi
+
             sleep 5
           done
+
           echo "Public website health check failed."
           exit 1
