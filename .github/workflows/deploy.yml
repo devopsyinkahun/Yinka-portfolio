@@ -1,63 +1,70 @@
-name: Build and deploy portfolio
+name: Build and Deploy Portfolio
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: portfolio-production
+  group: portfolio-deployment
   cancel-in-progress: false
 
 jobs:
-  validate-build-deploy:
+  deploy:
+    name: Build and Deploy to AWS EC2
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out source
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Validate website files
         run: python3 scripts/validate.py
 
       - name: Build Docker image
-        run: docker build --pull -t yinka-portfolio:${GITHUB_SHA} .
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            -t yinka-portfolio:${GITHUB_SHA} .
 
-      - name: Configure verified SSH access
+      - name: Configure SSH
         env:
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
         run: |
-          set -euo pipefail
-          install -m 700 -d "$HOME/.ssh"
-          printf '%s\n' "$EC2_SSH_KEY" > "$HOME/.ssh/deploy_key"
-          chmod 600 "$HOME/.ssh/deploy_key"
-          printf '%s\n' "$EC2_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
-          chmod 600 "$HOME/.ssh/known_hosts"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
 
-      - name: Transfer image to EC2
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Transfer Docker image
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
         run: |
-          set -euo pipefail
-          docker save "yinka-portfolio:${GITHUB_SHA}" | gzip | \
-            ssh -i "$HOME/.ssh/deploy_key" \
-              -o IdentitiesOnly=yes \
-              -o StrictHostKeyChecking=yes \
-              "$EC2_USER@$EC2_HOST" \
-              'gunzip | docker load'
+          docker save yinka-portfolio:${GITHUB_SHA} | gzip | \
+          ssh -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            'gunzip | docker load'
 
-      - name: Deploy exact commit with rollback protection
+      - name: Deploy to EC2
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          ssh -i "$HOME/.ssh/deploy_key" \
+          ssh -i ~/.ssh/deploy_key \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             "$EC2_USER@$EC2_HOST" \
@@ -66,6 +73,7 @@ jobs:
           set -eu
 
           NEW_IMAGE="yinka-portfolio:${IMAGE_TAG}"
+
           OLD_IMAGE=""
 
           if docker inspect portfolio >/dev/null 2>&1; then
@@ -80,22 +88,24 @@ jobs:
             -p 80:80 \
             "$NEW_IMAGE"
 
-          healthy=0
+          HEALTHY=0
 
           for attempt in $(seq 1 20); do
-            STATUS="$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' portfolio 2>/dev/null || true)"
+            STATUS="$(docker inspect \
+              --format='{{.State.Health.Status}}' \
+              portfolio 2>/dev/null || true)"
 
             if [ "$STATUS" = "healthy" ]; then
-              healthy=1
+              HEALTHY=1
               break
             fi
 
             sleep 3
           done
 
-          if [ "$healthy" -ne 1 ]; then
+          if [ "$HEALTHY" -ne 1 ]; then
             docker logs portfolio || true
-            docker rm -f portfolio >/dev/null 2>&1 || true
+            docker rm -f portfolio || true
 
             if [ -n "$OLD_IMAGE" ]; then
               docker run -d \
@@ -105,26 +115,30 @@ jobs:
                 "$OLD_IMAGE"
             fi
 
-            echo "Deployment failed. Previous image restored when available."
+            echo "Deployment failed."
             exit 1
           fi
 
-          echo "Deployed ${NEW_IMAGE}"
+          echo "Deployment successful."
 
           REMOTE
 
-      - name: Verify public website
+      - name: Verify website
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
           for attempt in $(seq 1 12); do
-            if curl --fail --silent --show-error "http://${EC2_HOST}/" >/dev/null; then
-              echo "Public website responds successfully."
+            if curl --fail --silent "http://${EC2_HOST}/" >/dev/null; then
+              echo "Website is responding successfully."
               exit 0
             fi
 
             sleep 5
           done
 
-          echo "Public website health check failed."
+          echo "Website verification failed."
           exit 1
+
+      - name: Clean up SSH credentials
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
